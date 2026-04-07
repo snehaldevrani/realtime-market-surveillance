@@ -29,11 +29,52 @@ class TornAPIClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
         self.session = None  # ADD THIS
+        self._session_created_at = None  # ADD THIS
+        self._max_session_age = 3600  # 1 hour - ADD THIS
         
     async def _get_session(self):
-        """Get or create persistent session."""
+        """Get or create persistent session with connection limits."""
+        import time
+    
+        current_time = time.time()
+    
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(timeout=self.timeout)
+            if self.session and not self.session.closed:
+                await self.session.close()
+        
+            # ADD connection limits to prevent memory bloat
+            connector = aiohttp.TCPConnector(
+                limit=100,  # Max 100 connections total
+                limit_per_host=10,  # Max 10 per host
+                ttl_dns_cache=300,  # DNS cache for 5 mins
+                force_close=True  # Force close connections
+            )
+        
+            self.session = aiohttp.ClientSession(
+                timeout=self.timeout,
+                connector=connector
+            )
+            self._session_created_at = current_time
+            logger.debug("Created new aiohttp session with connection limits")
+    
+        # Refresh old sessions
+        elif self._session_created_at and (current_time - self._session_created_at) > self._max_session_age:
+            logger.debug("Refreshing old aiohttp session")
+            await self.session.close()
+        
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=10,
+                ttl_dns_cache=300,
+                force_close=True
+            )
+        
+            self.session = aiohttp.ClientSession(
+                timeout=self.timeout,
+                connector=connector
+            )
+            self._session_created_at = current_time
+
         return self.session
 
     
@@ -243,23 +284,32 @@ class TornAPIClient:
 
         # Error 5: Too many requests (temporary)
         if error_code == 5:
-            logger.warning(f"⏸️ Rate limit hit on key {api_key[:8]}...: {error_msg}")
             key_manager.report_rate_limit(api_key)
     
         # Error 2: Incorrect key (permanent)
         elif error_code == 2:
-            logger.error(f"❌ Invalid API key {api_key[:8]}...: {error_msg}")
-            key_manager.report_invalid_key(api_key, error_code, error_msg)
+            # Get bot instance from global
+            from bot.discord_bot import get_bot
+            bot = get_bot()
+            await key_manager.report_invalid_key(api_key, error_code, error_msg, bot)
     
         # Error 13: Inactive account (permanent)
         elif error_code == 13:
-            logger.error(f"❌ Inactive account key {api_key[:8]}...: {error_msg}")
-            key_manager.report_invalid_key(api_key, error_code, error_msg)
+            from bot.discord_bot import get_bot
+            bot = get_bot()
+            await key_manager.report_invalid_key(api_key, error_code, error_msg, bot)
+            
+        # Error 16: Access level not high enough (permanent)
+        elif error_code == 16:
+            from bot.discord_bot import get_bot
+            bot = get_bot()
+            await key_manager.report_invalid_key(api_key, error_code, error_msg, bot)
     
         # Error 18: Paused key (permanent)
         elif error_code == 18:
-            logger.error(f"❌ Paused API key {api_key[:8]}...: {error_msg}")
-            key_manager.report_invalid_key(api_key, error_code, error_msg)
+            from bot.discord_bot import get_bot
+            bot = get_bot()
+            await key_manager.report_invalid_key(api_key, error_code, error_msg, bot)
     
         # Error 6: Incorrect ID (not a key issue)
         elif error_code == 6:
@@ -283,6 +333,7 @@ class TornAPIClient:
         """Close the persistent session."""
         if self.session and not self.session.closed:
             await self.session.close()
+            logger.info("Closed Torn API session")
 
 
 # Global instance

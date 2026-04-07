@@ -16,8 +16,7 @@ logging.basicConfig(
 # Prevent duplicate logs from discord.py
 logging.getLogger('discord').setLevel(logging.WARNING)
 
-
-
+from aiohttp import web
 import asyncio
 import os
 import sys
@@ -28,7 +27,7 @@ from dotenv import load_dotenv
 
 from database.db import get_database
 from database.models import MonitoredItemsModel
-from api.key_manager import init_key_manager
+from api.key_manager import init_key_manager, get_key_manager
 from bot.discord_bot import start_bot
 from utils.logger import setup_logger
 
@@ -38,6 +37,49 @@ load_dotenv()
 
 
 logger = logging.getLogger(__name__)
+
+# Add this new function:
+async def start_keepalive_server():
+    """
+    Start a simple HTTP server for keep-alive pings.
+    This prevents Discloud from shutting down due to inactivity.
+    """
+    async def health_check(request):
+        from core.monitor import get_monitor
+        try:
+            monitor = get_monitor()
+            stats = monitor.get_stats()
+            
+            return web.json_response({
+                'status': 'alive',
+                'uptime': stats.get('uptime', 'unknown'),
+                'cycles': stats.get('cycle_count', 0),
+                'is_running': stats.get('is_running', False)
+            })
+        except:
+            return web.json_response({
+                'status': 'alive',
+                'message': 'Bot is running'
+            })
+    
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Use PORT from environment (Discloud provides this) or default to 8080
+    port = int(os.getenv('PORT', 8080))
+    
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    logger.info(f"🌐 Keep-alive server started on port {port}")
+    
+    # Keep server running
+    while True:
+        await asyncio.sleep(3600)
 
 async def load_config() -> dict:
     """
@@ -68,8 +110,7 @@ async def validate_environment():
     """Validate required environment variables."""
     required_vars = [
         "DISCORD_BOT_TOKEN",
-        "DISCORD_ALERT_CHANNEL_ID",
-        "TORN_API_KEYS"
+        "ADMIN_DISCORD_ID"
     ]
     
     missing = []
@@ -110,25 +151,27 @@ async def initialize_database(config: dict):
             logger.info(f"Added monitored item: {item_config['name']} (ID: {item_config['item_id']})")
     
     logger.info("Database initialized")
+    # Migrate VIPs from config to database (one-time migration)
+    vip_players_from_config = config.get('vip_players', [])
+    if vip_players_from_config:
+        from database.models import VIPPlayersModel
+        vip_model = VIPPlayersModel()
+    
+        for vip_id in vip_players_from_config:
+            await vip_model.add_vip(vip_id, 0)  # 0 = system migration
+    
+        logger.info(f"Migrated {len(vip_players_from_config)} VIPs from config to database")
 
 
 async def initialize_api_keys():
-    """Initialize API key manager with keys from environment."""
-    api_keys_str = os.getenv("TORN_API_KEYS", "")
+    """Initialize API key manager (empty, keys added via commands)."""
+    init_key_manager()
     
-    if not api_keys_str:
-        logger.error("No Torn API keys provided!")
-        sys.exit(1)
+    # Load registered keys from database
+    key_manager = get_key_manager()
+    await key_manager.load_registered_keys()
     
-    # Split by comma and strip whitespace
-    api_keys = [key.strip() for key in api_keys_str.split(",") if key.strip()]
-    
-    if not api_keys:
-        logger.error("No valid API keys found!")
-        sys.exit(1)
-    
-    init_key_manager(api_keys)
-    logger.info(f"Initialized API key manager with {len(api_keys)} keys")
+    logger.info("API key manager initialized (use /admin_add_apikey to add admin keys)")
     
 # Add to main.py before starting the bot
 async def test_weav3r():
@@ -160,6 +203,7 @@ async def main():
     
     # Initialize database
     await initialize_database(config)
+    
     # Reset database on startup (clear old data)
     logger.info("Resetting database (clearing old tracking data)...")
     db = get_database()
@@ -171,14 +215,16 @@ async def main():
     
     # Get Discord settings
     bot_token = os.getenv("DISCORD_BOT_TOKEN")
-    alert_channel_id = int(os.getenv("DISCORD_ALERT_CHANNEL_ID"))
-    
-    # Call it in main():
+
+    # Test Weav3r (optional, you can keep this)
     await test_weav3r()
-    
+
+    # Start keep-alive server in background
+    asyncio.create_task(start_keepalive_server())
+
     # Start bot
     logger.info("Starting Discord bot...")
-    await start_bot(bot_token, config, alert_channel_id)
+    await start_bot(bot_token, config)
 
 
 if __name__ == "__main__":
@@ -189,7 +235,14 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        # Force cleanup and exit
-        import sys
+        # Proper cleanup
+        logger.info("Running cleanup...")
+        
+        # Give async tasks time to cleanup
+        import asyncio
+        import time
+        time.sleep(1)
+        
+        # Force exit
         import os
-        os._exit(0)  # Hard exit, bypasses all cleanup
+        os._exit(0)

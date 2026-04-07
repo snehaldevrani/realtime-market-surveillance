@@ -44,6 +44,8 @@ class Monitor:
         self.cycle_count = 0
         self.total_sales_detected = 0
         self.total_alerts_sent = 0
+        self._player_semaphore = asyncio.Semaphore(100)  # Reused across cycles, no memory leak
+        self._last_cleanup = 0  # Unix timestamp of last DB cleanup
     
     async def start(self):
         """Start the monitoring loop."""
@@ -113,8 +115,10 @@ class Monitor:
             # ============================================
             watch_list_players = await self.tracker.targets_model.get_watch_list_players()
 
-            # Add VIP players to watch list (always monitor)
-            vip_players = set(self.config.get('vip_players', []))
+            # Add VIP players from database (always monitor)
+            from database.models import VIPPlayersModel
+            vip_model = VIPPlayersModel()
+            vip_players = await vip_model.get_all_vips()
             watch_list_players = watch_list_players | vip_players
 
             logger.info(f"📋 Watch list: {len(watch_list_players)} players being monitored (including {len(vip_players)} VIPs)")
@@ -135,10 +139,8 @@ class Monitor:
             # ============================================
             logger.info(f"🚀 Phase 4: Fetching data for {len(active_monitoring)} players in parallel...")
         
-            semaphore = asyncio.Semaphore(100)  # Limit concurrent requests
-        
             async def monitor_player(player_id):
-                async with semaphore:
+                async with self._player_semaphore:
                     # Fetch bazaar + profile + job
                     data = await self.tracker.torn_client.fetch_user_data(player_id)
                 
@@ -170,27 +172,44 @@ class Monitor:
             # ============================================
             all_sales = []
             profile_updates = []
+            players_to_drop = set()  # Use set to avoid duplicates
+
+            # Get VIP list
+            vip_players = set(self.config.get('vip_players', []))
 
             for result in results:
                 if result is None or isinstance(result, Exception):
                     continue
-            
-                # Collect sales
-                if result['sales']:
-                    all_sales.extend(result['sales'])
-            
-                # Collect profile data for batch update
-                profile_updates.append({
-                    'player_id': result['player_id'],
-                    'profile_data': result['profile_data']
-                })
+    
+                player_id = result['player_id']
+                profile_data = result['profile_data']
         
+                # Collect sales (only if player not marked for dropping)
+                if result['sales'] and player_id not in players_to_drop:
+                    all_sales.extend(result['sales'])
+    
+                # Collect profile data for batch update (only if not dropped)
+                if player_id not in players_to_drop:
+                    profile_updates.append({
+                        'player_id': player_id,
+                        'profile_data': profile_data
+                    })
+
+            # Drop players with job protection (non-VIP only)
+            if players_to_drop:
+                logger.info(f"🛡️ Dropping {len(players_to_drop)} players with Clothing Store protection")
+                for player_id in players_to_drop:
+                    await self.tracker.targets_model.reset_target(player_id)
+
             logger.info(f"✅ Monitoring complete: {len(all_sales)} sales detected")
             
             # ============================================
             # Phase 5.5: Drop players who closed their bazaar
             # ============================================
-            vip_players = set(self.config.get('vip_players', []))
+            # Get VIP players from database
+            from database.models import VIPPlayersModel
+            vip_model = VIPPlayersModel()
+            vip_players = await vip_model.get_all_vips()
 
             for result in results:
                 if result is None or isinstance(result, Exception):
@@ -265,21 +284,75 @@ class Monitor:
             # ============================================
             cycle_duration = (datetime.now() - cycle_start).total_seconds()
             
-            from api.key_manager import get_key_manager
-            key_stats = get_key_manager().get_stats()
-            logger.info(
-                f"🔑 API Keys - Active: {key_stats['active']}, "
-                f"Rate Limited: {key_stats['rate_limited']}, "
-                f"Bad: {key_stats['permanently_bad']}"
-            )
             logger.info(
                 f"--- Cycle #{self.cycle_count} completed in {cycle_duration:.2f}s "
                 f"(Sales: {len(all_sales)}, Alerts: {len(targets_to_alert) if targets_to_alert else 0}) ---"
             )
+                        
+            # Force garbage collection every 10 cycles to free memory
+            if self.cycle_count % 10 == 0:
+                import gc
+                collected = gc.collect()
+                logger.debug(f"🗑️ Garbage collection: freed {collected} objects")
+            
+            # Run database cleanup every 8 hours
+            import time
+            now = time.time()
+            if now - self._last_cleanup > 28800:
+                logger.info("🧹 Running scheduled database cleanup...")
+                asyncio.create_task(self._run_cleanup())
+                self._last_cleanup = now
     
         except Exception as e:
             logger.error(f"Error in cycle: {e}", exc_info=True)
         
+
+    async def _run_cleanup(self):
+        """
+        Periodic database cleanup — runs every 8 hours.
+        Removes old data that piles up and eats RAM/disk.
+        Does NOT touch active targets, keys, VIPs, or channels.
+        """
+        try:
+            from database.db import get_database
+            db = get_database()
+            await db.connect()
+
+            # 1. Delete alert_log older than 3 days
+            await db.conn.execute(
+                "DELETE FROM alert_log WHERE alerted_at < datetime('now', '-3 days')"
+            )
+
+            # 2. Delete transaction_log older than 3 days
+            await db.conn.execute(
+                "DELETE FROM transaction_log WHERE detected_at < datetime('now', '-3 days')"
+            )
+
+            # 3. Delete dropped_targets older than 3 days
+            await db.conn.execute(
+                "DELETE FROM dropped_targets WHERE dropped_at < datetime('now', '-3 days')"
+            )
+
+            # 4. Delete stale bazaar snapshots for players not in tracked_targets
+            #    These pile up fastest — every player seen in listings gets a snapshot
+            #    but most are never tracked. Clean up snapshots older than 24 hours
+            #    for players not currently being tracked.
+            await db.conn.execute("""
+                DELETE FROM player_bazaar_snapshots 
+                WHERE player_id NOT IN (SELECT player_id FROM tracked_targets)
+                AND last_updated < datetime('now', '-1 day')
+            """)
+
+            await db.conn.commit()
+
+            # 5. VACUUM — reclaim disk space SQLite holds after deletes
+            await db.conn.execute("VACUUM")
+
+            logger.info("✅ Database cleanup complete")
+
+        except Exception as e:
+            logger.error(f"❌ Cleanup error: {e}")
+
     def get_stats(self) -> dict:
         """
         Get monitoring statistics.

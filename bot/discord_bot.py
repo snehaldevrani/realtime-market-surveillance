@@ -15,33 +15,41 @@ from utils.logger import get_logger
 import sys
 import logging
 
+# Global bot instance for key manager DMs
+_bot_instance = None
+
+def get_bot():
+    """Get global bot instance."""
+    return _bot_instance
+
 logger = get_logger(__name__)
 
 
 class MugBot(commands.Bot):
     """Custom Discord bot class for Torn Mug Bot."""
     
-    def __init__(self, config: dict, alert_channel_id: int):
+    def __init__(self, config: dict):
         """
         Initialize the bot.
-        
+    
         Args:
             config: Configuration dict
-            alert_channel_id: Discord channel ID for alerts
         """
         intents = discord.Intents.default()
         intents.message_content = True
-        
+    
         super().__init__(
-            command_prefix="!",  # Not used (slash commands only)
+            command_prefix="!",
             intents=intents,
             help_command=None
         )
-        
+    
         self.config = config
-        self.alert_channel_id = alert_channel_id
-        self.alert_channel: Optional[discord.TextChannel] = None
         self.monitor_task: Optional[asyncio.Task] = None
+    
+        # Set global bot instance
+        global _bot_instance
+        _bot_instance = self
     
     async def setup_hook(self):
         """Called when bot is starting up."""
@@ -63,27 +71,51 @@ class MugBot(commands.Bot):
         logger.info(f"✅ Bot logged in as {self.user} (ID: {self.user.id})")
         logger.info("=" * 60)
         
-        # Get alert channel
         try:
-            self.alert_channel = self.get_channel(self.alert_channel_id)
-            
-            if not self.alert_channel:
-                logger.error(f"Alert channel {self.alert_channel_id} not found!")
-                return
-            
-            logger.info(f"Alert channel: #{self.alert_channel.name} ({self.alert_channel.id})")
-            
-            # Initialize alerter with channel
-            init_alerter(self.alert_channel, self.config)
+            # Initialize alerter
+            init_alerter(self.config)
+            alerter = get_alerter()
+            alerter.set_bot(self)
             
             # Initialize monitor
             init_monitor(self.config)
+            
+            # DM admin to add keys
+            await self._dm_admin_startup()
             
             # Start monitoring task
             self.monitor_task = asyncio.create_task(self.start_monitoring())
             
         except Exception as e:
             logger.error(f"Error in on_ready: {e}", exc_info=True)
+    
+    async def _dm_admin_startup(self):
+        """DM admin on startup to remind them to add keys."""
+        try:
+            import os
+            admin_id = int(os.getenv("ADMIN_DISCORD_ID", 0))
+        
+            if admin_id:
+                admin_user = await self.fetch_user(admin_id)
+            
+                message = """🚀 **Mug Bot Started**
+
+    The bot is now online and monitoring.
+
+    ⚠️ **Action Required:** Add your admin API keys using:
+
+    `/admin_add_apikey keys:<comma_separated_keys>`
+
+    The bot will start with registered keys only until you add admin keys.
+
+    Bot will function normally but with reduced API capacity until admin keys are added."""
+            
+                await admin_user.send(message)
+                logger.info("✅ Sent startup DM to admin")
+    
+        except Exception as e:
+            logger.error(f"Failed to DM admin on startup: {e}")
+                
     
     async def start_monitoring(self):
         """Start the monitoring loop."""
@@ -107,12 +139,12 @@ class MugBot(commands.Bot):
     async def close(self):
         """Called when bot is shutting down."""
         logger.info("Shutting down bot...")
-        
+    
         # Stop monitoring
         try:
             monitor = get_monitor()
             monitor.stop()
-            
+        
             if self.monitor_task:
                 self.monitor_task.cancel()
                 try:
@@ -121,32 +153,41 @@ class MugBot(commands.Bot):
                     pass
         except:
             pass
-        
-        # Send shutdown message
+    
+        # Close all API clients
         try:
-            from api.torn import get_torn_client  # ADD THIS
-            torn_client = get_torn_client()       # ADD THIS
-            await torn_client.close() 
-            # alerter = get_alerter()
-            # await alerter.send_info_message("🛑 **Mug Bot Stopped** - Monitoring paused")
-        except:
-            pass
+            from api.torn import get_torn_client
+            from api.weav3r import get_weav3r_client
+            from database.db import get_database
         
+            torn_client = get_torn_client()
+            weav3r_client = get_weav3r_client()
+            db = get_database()
+        
+            logger.info("Closing API connections...")
+            await torn_client.close()
+            await weav3r_client.close()
+            from api.ffscouter import get_ffscouter_client
+            ffscouter_client = get_ffscouter_client()
+            await ffscouter_client.close()
+            await db.disconnect()
+        
+        except Exception as e:
+            logger.error(f"Error closing connections: {e}")
+    
         await super().close()
         logger.info("Bot shutdown complete")
 
 
-async def start_bot(token: str, config: dict, alert_channel_id: int):
+async def start_bot(token: str, config: dict):
     """
     Start the Discord bot.
     
     Args:
         token: Discord bot token
         config: Configuration dict
-        alert_channel_id: Channel ID for alerts
     """
-    bot = MugBot(config, alert_channel_id)
-    
+    bot = MugBot(config)
     try:
         await bot.start(token)
     except KeyboardInterrupt:

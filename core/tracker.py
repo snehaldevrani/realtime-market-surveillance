@@ -21,6 +21,10 @@ class TargetTracker:
         self.targets_model = TrackedTargetsModel()
         self.torn_client = get_torn_client()
         self.transaction_log = TransactionLogModel()
+        # Instantiate once — not inside loops every 5 seconds
+        from database.models import DroppedTargetsModel, VIPPlayersModel
+        self.drop_log = DroppedTargetsModel()
+        self.vip_model = VIPPlayersModel()
 
     
     async def process_detected_sales(self, sales: List[dict]):
@@ -78,8 +82,9 @@ class TargetTracker:
     async def apply_business_logic(self):
         """
         Apply all business logic to tracked targets:
-        - Drop rules (online, mugged, job protection, Cayman, stale)
-        - Travel logic (South Africa deductions)
+        - Drop rules (mugged, job protection, federal jail, stale)
+        - Travel logic (Cayman reset, South Africa deduction)
+        - CRITICAL: Players traveling are NOT dropped when coming online
     
         This runs AFTER profile data has been updated.
         """
@@ -89,11 +94,9 @@ class TargetTracker:
             return
     
         logger.debug(f"🔍 Applying business logic to {len(all_targets)} targets...")
-        
-        # Get VIP list from config (never drop these players)
-        from core.monitor import get_monitor
-        monitor = get_monitor()
-        vip_players = set(monitor.config.get('vip_players', []))
+    
+        # Get VIP list once before loop — not per-target
+        vip_players = await self.vip_model.get_all_vips()
     
         for target in all_targets:
             player_id = target['player_id']
@@ -103,7 +106,9 @@ class TargetTracker:
             # Extract data
             status_state = target.get('status_state', 'Unknown')
             status_description = target.get('status_description', '')
+            status_details = target.get('status_details')  # Can be None!
             is_traveling = (status_state == "Abroad")
+            is_returning = "Returning" in status_description
             last_action_minutes = target.get('last_action_minutes', 999)
             is_online = (last_action_minutes < 2)
         
@@ -112,57 +117,13 @@ class TargetTracker:
             sa_deduction_applied = target.get('sa_deduction_applied', 0)
         
             # ========================================
-            # CAYMAN ISLANDS - DROP (or reset for VIP)
+            # MUGGED - ALWAYS DROP (or reset for VIP)
+            # This is the ONLY way to drop traveling players
             # ========================================
-            if "Cayman Islands" in status_description:
-                if player_id in vip_players:
-                    logger.info(
-                        f"⭐ VIP {player_name} ({player_id}) in Cayman Islands - "
-                        f"Resetting accumulated from ${current_accumulated:,} to $0"
-                    )
-                    await self.targets_model.update_accumulated_and_travel(player_id, 0)
-                    current_accumulated = 0
-                else:
-                    logger.info(
-                        f"💰 {player_name} ({player_id}) traveling to/in Cayman Islands - "
-                        f"Dropping target (money storage)"
-                    )
-                    await self.targets_model.reset_target(player_id)
-                    continue
-        
-            # ========================================
-            # SOUTH AFRICA - DEDUCT $20M
-            # ========================================
-            if "South Africa" in status_description:
-                if "Returning" not in status_description and not sa_deduction_applied:
-                    logger.info(
-                        f"🇿🇦 {player_name} ({player_id}) in/traveling to South Africa - "
-                        f"Deducting $20M (Xanax runner). Was: ${current_accumulated:,}"
-                    )
-
-                    new_accumulated = current_accumulated - 20_000_000
-
-                    logger.info(
-                        f"    Now: ${new_accumulated:,} "
-                        f"{'(NEGATIVE - will monitor for more sales)' if new_accumulated < 0 else ''}"
-                    )
-                
-                    await self.targets_model.update_accumulated_and_travel(
-                        player_id, 
-                        new_accumulated, 
-                        sa_deduction_applied=True
-                    )
-                
-                    current_accumulated = new_accumulated
-                    sa_deduction_applied = True
-        
-            # ========================================
-            # MUGGED - DROP (or reset for VIP)
-            # ========================================
-            is_mugged = target.get('status_description', '').startswith('Mugged by')
+            is_mugged = status_details and 'Mugged by' in status_details
 
             if is_mugged:
-                mugger = target.get('status_description', '').replace('Mugged by ', '').strip()
+                mugger = status_details.replace('Mugged by ', '').strip()
 
                 if player_id in vip_players:
                     logger.info(
@@ -183,33 +144,76 @@ class TargetTracker:
                             f"Dropping. Lost ${current_accumulated:,}"
                         )
 
+                    # Log the drop
+                    await self.drop_log.log_drop(player_id, player_name, current_accumulated, f"Mugged by {mugger}")
+
                     await self.targets_model.reset_target(player_id)
                     continue
+                    
+            # ========================================
+            # CAYMAN ISLANDS - RESET MONEY (or reset for VIP)
+            # Only if NOT returning
+            # ========================================
+            if "Cayman Islands" in status_description and not is_returning:
+                if player_id in vip_players:
+                    logger.info(
+                        f"⭐ VIP {player_name} ({player_id}) in Cayman Islands - "
+                        f"Resetting accumulated from ${current_accumulated:,} to $0"
+                    )
+                    await self.targets_model.update_accumulated_and_travel(player_id, 0)
+                    current_accumulated = 0
+                else:
+                    logger.info(
+                        f"🏝️ {player_name} ({player_id}) in Cayman Islands - "
+                        f"Dropping (deposited ${current_accumulated:,})"
+                    )
+                    # Log the drop
+                    await self.drop_log.log_drop(player_id, player_name, current_accumulated, "Cayman Islands (deposited money)")
+
+                    await self.targets_model.reset_target(player_id)
+                    continue  # Skip rest of processing
+
+            # ========================================
+            # SOUTH AFRICA - DEDUCT $20M
+            # Only if NOT returning and haven't deducted yet
+            # ========================================
+            if "South Africa" in status_description and not is_returning and not sa_deduction_applied:
+                logger.info(
+                    f"🇿🇦 {player_name} ({player_id}) in South Africa - "
+                    f"Deducting $20M (Xanax runner). Was: ${current_accumulated:,}"
+                )
+
+                new_accumulated = current_accumulated - 20_000_000
+
+                logger.info(
+                    f"    Now: ${new_accumulated:,} "
+                    f"{'(NEGATIVE - will monitor for more sales)' if new_accumulated < 0 else ''}"
+                )
+
+                await self.targets_model.update_accumulated_and_travel(
+                    player_id, 
+                    new_accumulated, 
+                    sa_deduction_applied=True
+                )
+            
+                current_accumulated = new_accumulated
         
             # ========================================
-            # CLOTHING STORE MUG PROTECTION
-            # ========================================
-            # Job data is stored in profile_data from torn API
-            # We need to check if it's in the target record
-            # Actually, we already update this in batch_update_profile_data
-            # But job data isn't stored in tracked_targets table
-            # We need to add it there OR check it differently
-
-            # For now, skip this check - we'll add job columns to tracked_targets later if needed
-
-            # ========================================
-            # ONLINE STATUS
+            # ONLINE STATUS - ONLY DROP IF NOT TRAVELING
+            # If traveling, coming online doesn't matter (can't deposit money)
             # ========================================
             if is_online:
                 if is_traveling:
                     logger.info(
                         f"✈️ {player_name} ({player_id}) online while traveling - "
-                        f"Keep monitoring (${current_accumulated:,})"
+                        f"Keep monitoring (can't deposit while abroad) - ${current_accumulated:,}"
                     )
+                    # DON'T DROP - continue monitoring
                 else:
+                    # Not traveling, came online in Torn - reset/drop
                     if player_id in vip_players:
                         logger.info(
-                            f"⭐ VIP {player_name} ({player_id}) came online - "
+                            f"⭐ VIP {player_name} ({player_id}) came online in Torn - "
                             f"Resetting accumulated from ${current_accumulated:,} to $0"
                         )
                         await self.targets_model.update_accumulated_and_travel(player_id, 0)
@@ -217,17 +221,21 @@ class TargetTracker:
                     else:
                         logger.info(
                             f"🟢 {player_name} ({player_id}) came online in Torn - "
-                            f"Resetting accumulated ${current_accumulated:,}"
+                            f"Dropping. Was tracking ${current_accumulated:,}"
                         )
+                        # Log the drop
+                        await self.drop_log.log_drop(player_id, player_name, current_accumulated, "Came online in Torn")
+
                         await self.targets_model.reset_target(player_id)
                         continue
         
             # ========================================
             # LANDED BACK IN TORN - RESET SA FLAG
+            # Now they're back in Torn and can be treated normally
             # ========================================
             if status_state == "Okay" and previous_travel_state == "Abroad":
                 logger.info(f"🛬 {player_name} ({player_id}) landed back in Torn")
-            
+
                 if sa_deduction_applied:
                     await self.targets_model.reset_sa_deduction(player_id)
 
@@ -236,15 +244,18 @@ class TargetTracker:
             # ========================================
             if status_state == 'Federal':
                 logger.debug(f"Skipping Federal player {player_id}")
+                # Log the drop
+                await self.drop_log.log_drop(player_id, player_name, current_accumulated, "Federal jail")
+
                 await self.targets_model.reset_target(player_id)
                 continue
     
         # ========================================
-        # DROP STALE TARGETS (no sales for 2 hours, not in top 10)
+        # DROP STALE TARGETS (no sales for 2 hours)
         # ========================================
-        await self._drop_stale_targets_2hr(all_targets)
+        await self.dropstaletargets2hr(all_targets)
         
-    async def _drop_stale_targets_2hr(self, all_targets: List[dict]):
+    async def dropstaletargets2hr(self, all_targets: List[dict]):
         """
         Drop targets who haven't made a sale in 2 hours.
         This is called AFTER business logic, so we only drop non-critical targets.
@@ -252,6 +263,7 @@ class TargetTracker:
         from datetime import datetime, timedelta
 
         cutoff_time = datetime.now() - timedelta(hours=2)
+        vip_players = await self.vip_model.get_all_vips()  # Fetch once outside loop
     
         for target in all_targets:
             last_sale_time_str = target.get('last_sale_time')
@@ -268,10 +280,7 @@ class TargetTracker:
         
             # Check if stale (2+ hours no sales)
             if last_sale_time < cutoff_time:
-                # Get VIP list
-                from core.monitor import get_monitor
-                monitor = get_monitor()
-                vip_players = set(monitor.config.get('vip_players', []))
+                # VIP list already fetched once outside loop
     
                 if target['player_id'] in vip_players:
                     logger.info(
@@ -284,6 +293,10 @@ class TargetTracker:
                     f"🗑️ Dropping stale target {target['player_name']} ({target['player_id']}) - "
                     f"No sales in 2+ hours (last sale: {last_sale_time_str})"
                 )
+                await self.drop_log.log_drop(target['player_id'], target['player_name'],
+                                        target.get('accumulated_value', 0),
+                                        "Stale (no sales in 2+ hours)")
+
                 await self.targets_model.reset_target(target['player_id'])
 
     async def get_targets_for_alerts(self, min_accumulated: int, min_inactivity: int) -> List[dict]:

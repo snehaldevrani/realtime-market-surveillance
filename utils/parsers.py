@@ -80,7 +80,7 @@ def is_player_online(relative: str) -> bool:
     return minutes < 2
 
 
-def parse_status(status_data: dict) -> Tuple[str, str, bool]:
+def parse_status(status_data: dict) -> Tuple[str, str, str, bool]:
     """
     Parse status information from profile API.
     
@@ -88,18 +88,19 @@ def parse_status(status_data: dict) -> Tuple[str, str, bool]:
         status_data: Status dict from API response
         
     Returns:
-        Tuple of (state, description, is_vulnerable)
+        Tuple of (state, description, details, is_vulnerable)
     """
     if not status_data:
-        return "Unknown", "Unknown status", False
+        return "Unknown", "Unknown status", "", False
     
     state = status_data.get('state', 'Unknown')
     description = status_data.get('description', 'No description')
+    details = status_data.get('details', '')  # ADD THIS
     
     # Determine vulnerability
     is_alertable = (state == "Okay")
     
-    return state, description, is_alertable
+    return state, description, details, is_alertable  # RETURN 4 values now
 
 def is_player_mugged(status_data: dict) -> Tuple[bool, str]:
     """
@@ -143,7 +144,7 @@ def parse_profile_response(profile_data: dict, job_data: dict = None) -> dict:
     is_online = is_player_online(relative)
     last_action_status = last_action.get('status', 'Unknown')  
     
-    state, description, is_vulnerable = parse_status(status)
+    state, description, details, is_vulnerable = parse_status(status)  # CHANGE THIS LINE
     is_mugged, mugger_name = is_player_mugged(status)  # ADD THIS
     
     # Parse job data for mug protection check
@@ -163,6 +164,7 @@ def parse_profile_response(profile_data: dict, job_data: dict = None) -> dict:
         'is_online': is_online,
         'status_state': state,
         'status_description': description,
+        'status_details': details,  # ADD THIS LINE
         'is_vulnerable': is_vulnerable,
         'level': profile_data.get('level'),
         'faction_id': profile_data.get('faction_id'),

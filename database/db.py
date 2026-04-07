@@ -72,6 +72,7 @@ class Database:
                 last_action_status TEXT,
                 status_state TEXT,
                 status_description TEXT,
+                status_details TEXT,
                 first_detected TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_sale_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_alerted TIMESTAMP,
@@ -79,7 +80,9 @@ class Database:
                 sales_breakdown TEXT,
                 travel_state TEXT DEFAULT 'Okay',
                 travel_last_description TEXT,
-                sa_deduction_applied INTEGER DEFAULT 0
+                sa_deduction_applied INTEGER DEFAULT 0,
+                job_type_id INTEGER,
+                job_rating INTEGER
             )
         """)
         
@@ -136,6 +139,90 @@ class Database:
             ON alert_log(player_id)
         """)
         
+        # NEW TABLE: Registered user API keys
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS registered_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key TEXT UNIQUE NOT NULL,
+                discord_id INTEGER NOT NULL,
+                torn_user_id INTEGER NOT NULL,
+                torn_username TEXT NOT NULL,
+                profile_image TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used TIMESTAMP,
+                status TEXT DEFAULT 'active'
+            )
+        """)
+        
+        # NEW TABLE: Alert channels
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS alert_channels (
+                channel_id INTEGER PRIMARY KEY,
+                added_by_discord_id INTEGER NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # NEW TABLE: Filtered channel config (for low-stat targets)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS filtered_channel_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                channel_id INTEGER NOT NULL,
+                status INTEGER NOT NULL,
+                added_by_discord_id INTEGER NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # NEW TABLE: VIP players (persistent across restarts)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS vip_players (
+                player_id INTEGER PRIMARY KEY,
+                added_by_discord_id INTEGER NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # NEW TABLE: Dropped keys history
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS dropped_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_key TEXT,
+                source TEXT,
+                discord_id INTEGER,
+                torn_user_id INTEGER,
+                torn_username TEXT,
+                error_code INTEGER,
+                error_message TEXT,
+                requests_made INTEGER,
+                dropped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # NEW TABLE: Dropped targets history
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS dropped_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_id INTEGER NOT NULL,
+                player_name TEXT,
+                accumulated_value INTEGER,
+                drop_reason TEXT,
+                dropped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # INDEX for faster lookups
+        await self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dropped_targets_time 
+            ON dropped_targets(dropped_at)
+        """)
+        
+        # NEW INDEX: For registered keys
+        await self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_registered_keys_discord 
+            ON registered_keys(discord_id)
+        """)
+        
         await self.conn.commit()
         logger.info("Database tables created successfully")
     
@@ -177,7 +264,7 @@ class Database:
         await self.connect()
         
         # Count records in each table
-        cursor = await self.conn.execute("SELECT COUNT(*) FROM current_bazaar_state")
+        cursor = await self.conn.execute("SELECT COUNT(*) FROM player_bazaar_snapshots")
         bazaar_count = (await cursor.fetchone())[0]
         
         cursor = await self.conn.execute("SELECT COUNT(*) FROM tracked_targets")

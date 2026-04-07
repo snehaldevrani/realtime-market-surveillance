@@ -278,6 +278,7 @@ class TrackedTargetsModel:
     async def get_targets_for_alerts(self, min_accumulated: int, min_inactivity: int) -> List[dict]:
         """
         Get all targets that meet alert criteria AND haven't been alerted at current value.
+        Applies Clothing Store protection multiplier.
     
         Args:
             min_accumulated: Minimum accumulated value
@@ -290,16 +291,35 @@ class TrackedTargetsModel:
     
         cursor = await self.db.conn.execute("""
             SELECT * FROM tracked_targets
-            WHERE accumulated_value >= ?
+            WHERE status_state = 'Okay'
             AND last_action_minutes >= ?
-            AND status_state = 'Okay'
             AND (last_alerted_value IS NULL OR accumulated_value > last_alerted_value)
             ORDER BY accumulated_value DESC
-        """, (min_accumulated, min_inactivity))
+        """, (min_inactivity,))
     
         rows = await cursor.fetchall()
+        targets = []
 
-        return [dict(row) for row in rows]
+        # Filter based on effective accumulated value (with protection multiplier)
+        for row in rows:
+            target = dict(row)
+            accumulated = target['accumulated_value']
+            
+            # Check for Clothing Store protection
+            job_type_id = target.get('job_type_id')
+            job_rating = target.get('job_rating')
+            has_protection = (job_type_id == 5 and job_rating is not None and job_rating >= 7)
+            
+            if has_protection:
+                effective_accumulated = int(accumulated * 0.25)
+            else:
+                effective_accumulated = accumulated
+            
+            # Only include if effective value meets threshold
+            if effective_accumulated >= min_accumulated:
+                targets.append(target)
+
+        return targets
     
     async def get_all_targets(self) -> List[dict]:
         """
@@ -341,21 +361,21 @@ class TrackedTargetsModel:
     async def batch_update_profile_data(self, updates: List[dict]):
         """
         Batch update profile data for multiple targets.
-        
+    
         Args:
             updates: List of dicts with player_id and profile data
         """
         if not updates:
             return
-        
+    
         await self.db.connect()
-        
+    
         # Prepare batch data
         batch_data = []
         for update in updates:
             player_id = update['player_id']
             profile_data = update['profile_data']
-            
+        
             batch_data.append((
                 profile_data['last_action_relative'],
                 profile_data['last_action_minutes'],
@@ -363,11 +383,14 @@ class TrackedTargetsModel:
                 profile_data['last_action_status'],
                 profile_data['status_state'],
                 profile_data['status_description'],
+                profile_data.get('status_details', ''),  # ADD THIS
                 profile_data['status_state'],  # travel_state
                 profile_data['status_description'],  # travel_last_description
+                profile_data.get('job_type_id'),  # ADD THIS
+                profile_data.get('job_rating'),  # ADD THIS
                 player_id
             ))
-        
+    
         # Execute batch update
         await self.db.conn.executemany("""
             UPDATE tracked_targets
@@ -377,11 +400,14 @@ class TrackedTargetsModel:
                 last_action_status = ?,
                 status_state = ?,
                 status_description = ?,
+                status_details = ?,
                 travel_state = ?,
-                travel_last_description = ?
+                travel_last_description = ?,
+                job_type_id = ?,
+                job_rating = ?
             WHERE player_id = ?
         """, batch_data)
-        
+    
         await self.db.conn.commit()
         logger.debug(f"✅ Batch updated {len(updates)} target profiles")
         
@@ -564,3 +590,99 @@ class TransactionLogModel:
         """, (player_id,))
         
         return [dict(row) for row in await cursor.fetchall()]
+    
+class DroppedTargetsModel:
+    """Log dropped targets for admin review."""
+    
+    def __init__(self):
+        self.db = get_database()
+    
+    async def log_drop(self, player_id: int, player_name: str, 
+                      accumulated_value: int, drop_reason: str):
+        """Log a target being dropped."""
+        await self.db.connect()
+        
+        await self.db.conn.execute("""
+            INSERT INTO dropped_targets (
+                player_id, player_name, accumulated_value, drop_reason, dropped_at
+            )
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (player_id, player_name, accumulated_value, drop_reason))
+        
+        await self.db.conn.commit()
+    
+    async def get_recent_drops(self, limit: int = 10, hours: int = 8):
+        """Get recently dropped targets within specified hours."""
+        await self.db.connect()
+        
+        cursor = await self.db.conn.execute("""
+            SELECT * FROM dropped_targets
+            WHERE dropped_at >= datetime('now', '-' || ? || ' hours')
+            ORDER BY dropped_at DESC
+            LIMIT ?
+        """, (hours, limit))
+        
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def cleanup_old_drops(self, hours: int = 8):
+        """Clean up drops older than specified hours."""
+        await self.db.connect()
+        
+        cursor = await self.db.conn.execute("""
+            DELETE FROM dropped_targets
+            WHERE dropped_at < datetime('now', '-' || ? || ' hours')
+        """, (hours,))
+        
+        await self.db.conn.commit()
+        return cursor.rowcount
+    
+class VIPPlayersModel:
+    """Manage VIP players (always monitored, never dropped)."""
+    
+    def __init__(self):
+        self.db = get_database()
+    
+    async def add_vip(self, player_id: int, added_by_discord_id: int):
+        """Add a player to VIP list."""
+        await self.db.connect()
+        
+        try:
+            await self.db.conn.execute("""
+                INSERT INTO vip_players (player_id, added_by_discord_id)
+                VALUES (?, ?)
+            """, (player_id, added_by_discord_id))
+            await self.db.conn.commit()
+            return True
+        except Exception as e:
+            # Already exists
+            return False
+    
+    async def remove_vip(self, player_id: int):
+        """Remove a player from VIP list."""
+        await self.db.connect()
+        
+        cursor = await self.db.conn.execute(
+            "DELETE FROM vip_players WHERE player_id = ?",
+            (player_id,)
+        )
+        await self.db.conn.commit()
+        return cursor.rowcount > 0
+    
+    async def get_all_vips(self) -> set:
+        """Get set of all VIP player IDs."""
+        await self.db.connect()
+        
+        cursor = await self.db.conn.execute("SELECT player_id FROM vip_players")
+        rows = await cursor.fetchall()
+        return {row['player_id'] for row in rows}
+    
+    async def is_vip(self, player_id: int) -> bool:
+        """Check if player is VIP."""
+        await self.db.connect()
+        
+        cursor = await self.db.conn.execute(
+            "SELECT 1 FROM vip_players WHERE player_id = ?",
+            (player_id,)
+        )
+        return await cursor.fetchone() is not None

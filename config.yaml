@@ -6,8 +6,8 @@ bot:
 
 # Monitoring Settings
 monitoring:
-  check_interval: 15  # seconds
-  top_bazaars_count: 12  # Only monitor top N cheapest listings
+  check_interval: 5  # seconds
+  top_bazaars_count: 8  # Only monitor top N cheapest listings
   weav3r_batch_size: 10  # Number of items to fetch concurrently
   weav3r_batch_delay: 1.0  # Seconds to wait between batches (adjust to test Cloudflare limits)
 
@@ -248,5 +248,5 @@ api:
 logging:
   level: "INFO"
   file: "mug_bot.log"
-  max_size_mb: 50
+  max_size_mb: 200
   backup_count: 5
