@@ -216,7 +216,7 @@ def format_alert_embed_data(target: dict, config: dict, item_names: Dict[int, st
         status_display = status_state
     
     # Attack link
-    attack_url = f"https://www.torn.com/loader.php?sid=attack&user2ID={player_id}"
+    attack_url = f"https://www.torn.com/page.php?sid=attack&user2ID={player_id}"
     
     # Sales breakdown
     if sales_breakdown:

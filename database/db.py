@@ -223,6 +223,33 @@ class Database:
             ON registered_keys(discord_id)
         """)
         
+        # NEW TABLE: Persistent admin keys (survive restarts)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_keys (
+                api_key TEXT PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # NEW TABLE: Exception players (friends — never mug)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS exception_players (
+                player_name TEXT PRIMARY KEY COLLATE NOCASE,
+                added_by_discord_id INTEGER NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # NEW TABLE: Exception factions (allied factions — never mug members)
+        await self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS exception_factions (
+                faction_id INTEGER PRIMARY KEY,
+                faction_name TEXT,
+                added_by_discord_id INTEGER NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         await self.conn.commit()
         logger.info("Database tables created successfully")
     

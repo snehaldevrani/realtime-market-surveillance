@@ -29,7 +29,7 @@ class APIKeyManager:
     
     def add_admin_keys(self, api_keys: List[str]):
         """
-        Add admin keys to in-memory pool (NO LOGGING).
+        Add admin keys to pool and persist to database.
         
         Args:
             api_keys: List of API keys to add
@@ -50,6 +50,49 @@ class APIKeyManager:
         
         # NO CONSOLE LOG - completely silent
         return added_count
+    
+    async def persist_admin_keys(self):
+        """Save current admin keys to database so they survive restarts."""
+        db = get_database()
+        await db.connect()
+        
+        for key in self.admin_keys:
+            if key not in self.permanently_bad_keys:
+                try:
+                    await db.conn.execute(
+                        "INSERT OR IGNORE INTO admin_keys (api_key) VALUES (?)",
+                        (key,)
+                    )
+                except Exception:
+                    pass
+        
+        await db.conn.commit()
+    
+    async def load_admin_keys(self):
+        """Load admin keys from database on startup."""
+        db = get_database()
+        await db.connect()
+        
+        cursor = await db.conn.execute("SELECT api_key FROM admin_keys")
+        rows = await cursor.fetchall()
+        
+        loaded = 0
+        for row in rows:
+            key = row['api_key']
+            if key not in self.admin_keys and key not in self.permanently_bad_keys:
+                self.admin_keys.append(key)
+                self.key_usage[key] = {
+                    'count': 0,
+                    'reset_time': time.time() + 60,
+                    'status': 'active',
+                    'rate_limited_until': 0,
+                    'source': 'admin',
+                    'requests_made': 0
+                }
+                loaded += 1
+        
+        if loaded:
+            logger.info(f"✅ Loaded {loaded} admin keys from database")
     
     async def load_registered_keys(self):
         """Load active registered keys from database."""
@@ -208,8 +251,10 @@ class APIKeyManager:
         # Remove from admin keys list if admin key
         if api_key in self.admin_keys:
             self.admin_keys.remove(api_key)
+            # Also remove from persistent DB
+            await db.conn.execute("DELETE FROM admin_keys WHERE api_key = ?", (api_key,))
+            await db.conn.commit()
         
-        # Mark as inactive in DB if registered
         # Delete from DB if registered (auto-unregister)
         if source == 'registered':
             await db.conn.execute("DELETE FROM registered_keys WHERE api_key = ?", (api_key,))

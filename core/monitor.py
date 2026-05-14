@@ -46,6 +46,13 @@ class Monitor:
         self.total_alerts_sent = 0
         self._player_semaphore = asyncio.Semaphore(100)  # Reused across cycles, no memory leak
         self._last_cleanup = 0  # Unix timestamp of last DB cleanup
+        
+        # Weav3r discovery cycling state
+        self._weav3r_item_offset = 0  # Current position in the monitored items list
+        self._weav3r_items_per_minute = 44  # Weav3r rate limit
+        self._last_discovery_time = 0  # Unix timestamp of last Weav3r scan
+        self._discovery_interval = 60  # Seconds between Weav3r discovery runs
+        self._discovered_players_cache: set = set()  # Persists between cycles
     
     async def start(self):
         """Start the monitoring loop."""
@@ -101,14 +108,75 @@ class Monitor:
         try:
             # ============================================
             # Phase 1: Discovery - Find active players from weav3r
+            # Only runs once per minute, cycling 44 items at a time
             # ============================================
-            logger.info(f"🔍 Phase 1: Discovering active players from weav3r...")
-        
-            discovered_players = await self.detector.discover_active_players(
-                top_n=self.top_bazaars
-            )
-        
-            logger.info(f"✅ Discovered {len(discovered_players)} players in top listings")
+            import time as _time
+            now_ts = _time.time()
+            
+            if now_ts - self._last_discovery_time >= self._discovery_interval:
+                all_items = await self.items_model.get_enabled_items()
+                total_items = len(all_items)
+                
+                if total_items > 0:
+                    # Grab the next 44 items from the rotating offset
+                    batch_size = self._weav3r_items_per_minute
+                    start = self._weav3r_item_offset
+                    
+                    if start >= total_items:
+                        start = 0
+                        self._weav3r_item_offset = 0
+                    
+                    # Handle wrap-around: if offset+44 exceeds list, wrap to beginning
+                    if start + batch_size <= total_items:
+                        batch_items = all_items[start:start + batch_size]
+                    else:
+                        batch_items = all_items[start:] + all_items[:batch_size - (total_items - start)]
+                    
+                    logger.info(
+                        f"🔍 Phase 1: Weav3r discovery — scanning items {start+1}-"
+                        f"{min(start + batch_size, total_items)} of {total_items} "
+                        f"({len(batch_items)} items this batch)"
+                    )
+                    
+                    new_players = await self.detector.discover_active_players_from_items(
+                        items=batch_items,
+                        top_n=self.top_bazaars,
+                        batch_size=self.weav3r_batch_size,
+                        batch_delay=self.weav3r_batch_delay,
+                    )
+                    
+                    # Advance the offset for the next discovery run
+                    next_offset = (start + batch_size) % total_items
+                    
+                    # If we wrapped around, clear the cache to avoid stale player IDs
+                    # (they'll be re-discovered on the next full rotation if still active)
+                    if next_offset < start:
+                        old_size = len(self._discovered_players_cache)
+                        # Keep only players that are currently tracked (watch list)
+                        watch_players = await self.tracker.targets_model.get_watch_list_players()
+                        self._discovered_players_cache = new_players | watch_players
+                        logger.info(
+                            f"🔄 Full item rotation completed — cache refreshed "
+                            f"({old_size} → {len(self._discovered_players_cache)} players)"
+                        )
+                    else:
+                        # Merge into persistent cache
+                        self._discovered_players_cache |= new_players
+                    
+                    self._weav3r_item_offset = next_offset
+                    self._last_discovery_time = now_ts
+                    
+                    logger.info(
+                        f"✅ Discovered {len(new_players)} new players this batch, "
+                        f"{len(self._discovered_players_cache)} total in cache"
+                    )
+                else:
+                    logger.warning("No items configured for monitoring")
+            else:
+                seconds_until = int(self._discovery_interval - (now_ts - self._last_discovery_time))
+                logger.debug(f"⏳ Weav3r discovery skipped (next scan in {seconds_until}s)")
+            
+            discovered_players = self._discovered_players_cache
         
             # ============================================
             # Phase 2: Get watch list players
@@ -158,7 +226,8 @@ class Monitor:
                         'player_id': player_id,
                         'sales': sales,
                         'profile_data': data['profile_data'],
-                        'bazaar': data['bazaar']
+                        'bazaar': data['bazaar'],
+                        'bazaar_is_open': data.get('bazaar_is_open', True)
                     }
         
             # Create tasks for all players
@@ -177,12 +246,36 @@ class Monitor:
             # Get VIP list
             vip_players = set(self.config.get('vip_players', []))
 
+            # Load exception lists once per cycle
+            from database.models import ExceptionModel
+            exception_model = ExceptionModel()
+            excepted_players = await exception_model.get_player_names_set()
+            excepted_factions = await exception_model.get_faction_ids_set()
+
             for result in results:
                 if result is None or isinstance(result, Exception):
                     continue
     
                 player_id = result['player_id']
                 profile_data = result['profile_data']
+                
+                # Check exception lists — drop instantly if matched
+                player_name = profile_data.get('player_name', '')
+                faction_id = profile_data.get('faction_id')
+                
+                if player_name.lower() in excepted_players:
+                    logger.info(f"🛡️ Exception: {player_name} ({player_id}) is on player exception list — skipping")
+                    target = await self.tracker.targets_model.get_target(player_id)
+                    if target:
+                        await self.tracker.targets_model.reset_target(player_id)
+                    continue
+                
+                if faction_id and faction_id in excepted_factions:
+                    logger.info(f"🛡️ Exception: {player_name} ({player_id}) is in excepted faction {faction_id} — skipping")
+                    target = await self.tracker.targets_model.get_target(player_id)
+                    if target:
+                        await self.tracker.targets_model.reset_target(player_id)
+                    continue
         
                 # Collect sales (only if player not marked for dropping)
                 if result['sales'] and player_id not in players_to_drop:
@@ -294,6 +387,23 @@ class Monitor:
                 import gc
                 collected = gc.collect()
                 logger.debug(f"🗑️ Garbage collection: freed {collected} objects")
+            
+            # Log memory usage every 50 cycles (~4 minutes at 5s interval)
+            if self.cycle_count % 50 == 0:
+                try:
+                    import psutil, os
+                    process = psutil.Process(os.getpid())
+                    mem = process.memory_info()
+                    mem_mb = mem.rss / (1024 * 1024)
+                    logger.info(
+                        f"📊 Memory: {mem_mb:.1f} MB RSS | "
+                        f"Discovery cache: {len(self._discovered_players_cache)} players"
+                    )
+                    # Warn if memory is getting high (>800MB on 1GB t2.micro)
+                    if mem_mb > 800:
+                        logger.warning(f"⚠️ HIGH MEMORY: {mem_mb:.1f} MB — consider restarting")
+                except ImportError:
+                    pass
             
             # Run database cleanup every 8 hours
             import time

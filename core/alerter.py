@@ -202,20 +202,7 @@ class Alerter:
             
             # Add fields
             embed.add_field(
-                name="👤 Player",
-                value=embed_data['player_info'],
-                inline=False
-            )
-            
-            embed.add_field(
-                name="💰 Cash on Hand",
-                value=f"**{embed_data['cash_short']}** ({embed_data['cash_full']})",
-                inline=True
-            )
-            
-            # ADD THIS NEW FIELD:
-            embed.add_field(
-                name="💎 Max Potential Mug",
+                name="� Max Potential Mug",
                 value=f"**{embed_data['max_mug_short']}** ({embed_data['max_mug_full']})",
                 inline=True
             )
@@ -229,14 +216,6 @@ class Alerter:
                     value=f"~{bs_human}",
                     inline=True
                 )
-            
-            # Add protection note if applicable
-            if protection_note:
-                embed.add_field(
-                    name="🛡️ Protection",
-                    value=protection_note,
-                    inline=False
-                )
                         
             embed.add_field(
                 name="⏱️ Last Action",
@@ -247,12 +226,6 @@ class Alerter:
             embed.add_field(
                 name="📶 Activity Status",
                 value=embed_data['status_display_text'],
-                inline=True
-            )
-
-            embed.add_field(
-                name="📍 Game Status",
-                value=embed_data['status_display'],
                 inline=True
             )
             
@@ -266,14 +239,6 @@ class Alerter:
                 value=tct_display,
                 inline=True
             )
-            
-            # Add breakdown if multiple items
-            if embed_data['breakdown']:
-                embed.add_field(
-                    name="📦 Sales Breakdown",
-                    value=embed_data['breakdown'],
-                    inline=False
-                )
             
             # Add footer
             # Add footer with TCT time

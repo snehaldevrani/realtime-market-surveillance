@@ -686,3 +686,84 @@ class VIPPlayersModel:
             (player_id,)
         )
         return await cursor.fetchone() is not None
+
+
+class ExceptionModel:
+    """Manage exception lists for players and factions that should never be mugged."""
+    
+    def __init__(self):
+        self.db = get_database()
+    
+    # ---- Player exceptions ----
+    
+    async def add_player(self, player_name: str, added_by: int) -> bool:
+        """Add a player name to the exception list."""
+        await self.db.connect()
+        try:
+            await self.db.conn.execute(
+                "INSERT INTO exception_players (player_name, added_by_discord_id) VALUES (?, ?)",
+                (player_name, added_by)
+            )
+            await self.db.conn.commit()
+            return True
+        except Exception:
+            return False
+    
+    async def remove_player(self, player_name: str) -> bool:
+        """Remove a player name from the exception list."""
+        await self.db.connect()
+        cursor = await self.db.conn.execute(
+            "DELETE FROM exception_players WHERE player_name = ? COLLATE NOCASE",
+            (player_name,)
+        )
+        await self.db.conn.commit()
+        return cursor.rowcount > 0
+    
+    async def get_all_players(self) -> list:
+        """Get all excepted player names."""
+        await self.db.connect()
+        cursor = await self.db.conn.execute("SELECT player_name FROM exception_players")
+        rows = await cursor.fetchall()
+        return [row['player_name'] for row in rows]
+    
+    async def get_player_names_set(self) -> set:
+        """Get set of lowercased player names for fast matching."""
+        names = await self.get_all_players()
+        return {n.lower() for n in names}
+    
+    # ---- Faction exceptions ----
+    
+    async def add_faction(self, faction_id: int, faction_name: str, added_by: int) -> bool:
+        """Add a faction to the exception list."""
+        await self.db.connect()
+        try:
+            await self.db.conn.execute(
+                "INSERT INTO exception_factions (faction_id, faction_name, added_by_discord_id) VALUES (?, ?, ?)",
+                (faction_id, faction_name, added_by)
+            )
+            await self.db.conn.commit()
+            return True
+        except Exception:
+            return False
+    
+    async def remove_faction(self, faction_id: int) -> bool:
+        """Remove a faction from the exception list."""
+        await self.db.connect()
+        cursor = await self.db.conn.execute(
+            "DELETE FROM exception_factions WHERE faction_id = ?",
+            (faction_id,)
+        )
+        await self.db.conn.commit()
+        return cursor.rowcount > 0
+    
+    async def get_all_factions(self) -> list:
+        """Get all excepted factions as list of dicts."""
+        await self.db.connect()
+        cursor = await self.db.conn.execute("SELECT faction_id, faction_name FROM exception_factions")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+    
+    async def get_faction_ids_set(self) -> set:
+        """Get set of faction IDs for fast matching."""
+        factions = await self.get_all_factions()
+        return {f['faction_id'] for f in factions}

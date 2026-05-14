@@ -83,6 +83,63 @@ class SaleDetector:
         logger.info(f"✅ Discovered {len(discovered_players)} unique players in top listings")
         return discovered_players
 
+    async def discover_active_players_from_items(
+        self,
+        items: list,
+        top_n: int = 10,
+        batch_size: int = 5,
+        batch_delay: float = 1.5,
+    ) -> set:
+        """
+        Discover active players from a pre-selected slice of items.
+        Used by the monitor's rotating discovery cycle (44 items/minute).
+
+        Args:
+            items:       List of item dicts to scan (already sliced by caller)
+            top_n:       Number of top listings to check per item
+            batch_size:  How many items to fetch concurrently per batch
+            batch_delay: Seconds to wait between batches
+
+        Returns:
+            Set of player_ids currently in top listings
+        """
+        if not items:
+            return set()
+
+        logger.info(
+            f"🔍 Scanning weav3r: {len(items)} items, "
+            f"batch_size={batch_size}, delay={batch_delay}s"
+        )
+
+        discovered_players = set()
+
+        for batch_start in range(0, len(items), batch_size):
+            batch = items[batch_start: batch_start + batch_size]
+            batch_num = (batch_start // batch_size) + 1
+            total_batches = (len(items) + batch_size - 1) // batch_size
+
+            logger.debug(f"  Batch {batch_num}/{total_batches}: fetching {len(batch)} items")
+
+            tasks = [
+                self.weav3r_client.fetch_bazaar_data(item['item_id'], top_n)
+                for item in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"❌ Failed to fetch {batch[i]['item_name']}: {result}")
+                    continue
+                if result:
+                    for listing in result:
+                        discovered_players.add(listing['player_id'])
+
+            if batch_start + batch_size < len(items):
+                await asyncio.sleep(batch_delay)
+
+        logger.info(f"✅ Discovered {len(discovered_players)} unique players from {len(items)} items")
+        return discovered_players
+
     async def detect_sales_for_player(self, player_id: int, player_name: str, current_bazaar: List[dict]) -> List[dict]:
         """
         Detect sales for a single player by comparing bazaar snapshots.

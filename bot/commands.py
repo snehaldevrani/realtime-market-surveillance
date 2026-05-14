@@ -11,7 +11,7 @@ import aiohttp
 import typing
 
 from core.monitor import get_monitor
-from database.models import AlertLogModel, MonitoredItemsModel
+from database.models import AlertLogModel, MonitoredItemsModel, ExceptionModel
 from database.db import get_database
 from api.key_manager import get_key_manager
 from utils.logger import get_logger
@@ -62,8 +62,11 @@ class BotCommands(commands.Cog):
             key_manager = get_key_manager()
             added_count = key_manager.add_admin_keys(key_list)
             
+            # Persist to database so they survive restarts
+            await key_manager.persist_admin_keys()
+            
             await interaction.followup.send(
-                f"✅ Added {added_count} admin keys (in-memory, will clear on restart)",
+                f"✅ Added {added_count} admin keys (persisted to database)",
                 ephemeral=True
             )
         
@@ -104,6 +107,11 @@ class BotCommands(commands.Cog):
             if key_to_remove in key_manager.admin_keys:
                 key_manager.admin_keys.remove(key_to_remove)
                 del key_manager.key_usage[key_to_remove]
+                # Also remove from persistent DB
+                db = get_database()
+                await db.connect()
+                await db.conn.execute("DELETE FROM admin_keys WHERE api_key = ?", (key_to_remove,))
+                await db.conn.commit()
                 await interaction.followup.send(f"✅ Removed admin key ***{key_suffix}", ephemeral=True)
             else:
                 db = get_database()
@@ -978,46 +986,219 @@ class BotCommands(commands.Cog):
             logger.error(f"Error in stats command: {e}", exc_info=True)
             await interaction.followup.send("❌ Error retrieving statistics", ephemeral=True)
     
+    @app_commands.command(name="admin_manage_exception", description="[ADMIN] Manage player/faction exception list")
+    @app_commands.describe(
+        exception_type="Player or Faction",
+        action="Add, Remove, or List exceptions",
+        value="Player username or Faction ID (not needed for List)"
+    )
+    @app_commands.choices(
+        exception_type=[
+            app_commands.Choice(name="Player", value="player"),
+            app_commands.Choice(name="Faction", value="faction"),
+        ],
+        action=[
+            app_commands.Choice(name="Add", value="add"),
+            app_commands.Choice(name="Remove", value="remove"),
+            app_commands.Choice(name="List", value="list"),
+        ]
+    )
+    @is_admin()
+    async def admin_manage_exception(
+        self,
+        interaction: discord.Interaction,
+        exception_type: app_commands.Choice[str],
+        action: app_commands.Choice[str],
+        value: str = None
+    ):
+        """Manage exception lists — excepted players/factions are instantly dropped and never mugged."""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            exception_model = ExceptionModel()
+            
+            if exception_type.value == "player":
+                if action.value == "add":
+                    if not value:
+                        await interaction.followup.send("❌ Please provide a player username", ephemeral=True)
+                        return
+                    added = await exception_model.add_player(value.strip(), interaction.user.id)
+                    if added:
+                        await interaction.followup.send(f"✅ Added **{value.strip()}** to player exception list", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ **{value.strip()}** is already in the exception list", ephemeral=True)
+                
+                elif action.value == "remove":
+                    if not value:
+                        await interaction.followup.send("❌ Please provide a player username", ephemeral=True)
+                        return
+                    removed = await exception_model.remove_player(value.strip())
+                    if removed:
+                        await interaction.followup.send(f"✅ Removed **{value.strip()}** from player exception list", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ **{value.strip()}** not found in exception list", ephemeral=True)
+                
+                elif action.value == "list":
+                    players = await exception_model.get_all_players()
+                    if players:
+                        player_list = "\n".join(f"• {name}" for name in players)
+                        embed = discord.Embed(
+                            title="🛡️ Excepted Players",
+                            description=player_list,
+                            color=discord.Color.green()
+                        )
+                        embed.set_footer(text=f"{len(players)} player(s) excepted")
+                        await interaction.followup.send(embed=embed, ephemeral=True)
+                    else:
+                        await interaction.followup.send("No players in exception list", ephemeral=True)
+            
+            elif exception_type.value == "faction":
+                if action.value == "add":
+                    if not value:
+                        await interaction.followup.send("❌ Please provide a faction ID", ephemeral=True)
+                        return
+                    try:
+                        faction_id = int(value.strip())
+                    except ValueError:
+                        await interaction.followup.send("❌ Faction ID must be a number", ephemeral=True)
+                        return
+                    faction_name = f"Faction #{faction_id}"
+                    added = await exception_model.add_faction(faction_id, faction_name, interaction.user.id)
+                    if added:
+                        await interaction.followup.send(f"✅ Added faction **{faction_id}** to exception list", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ Faction **{faction_id}** is already in the exception list", ephemeral=True)
+                
+                elif action.value == "remove":
+                    if not value:
+                        await interaction.followup.send("❌ Please provide a faction ID", ephemeral=True)
+                        return
+                    try:
+                        faction_id = int(value.strip())
+                    except ValueError:
+                        await interaction.followup.send("❌ Faction ID must be a number", ephemeral=True)
+                        return
+                    removed = await exception_model.remove_faction(faction_id)
+                    if removed:
+                        await interaction.followup.send(f"✅ Removed faction **{faction_id}** from exception list", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ Faction **{faction_id}** not found in exception list", ephemeral=True)
+                
+                elif action.value == "list":
+                    factions = await exception_model.get_all_factions()
+                    if factions:
+                        faction_list = "\n".join(f"• {f['faction_name']} (ID: {f['faction_id']})" for f in factions)
+                        embed = discord.Embed(
+                            title="🛡️ Excepted Factions",
+                            description=faction_list,
+                            color=discord.Color.green()
+                        )
+                        embed.set_footer(text=f"{len(factions)} faction(s) excepted")
+                        await interaction.followup.send(embed=embed, ephemeral=True)
+                    else:
+                        await interaction.followup.send("No factions in exception list", ephemeral=True)
+        
+        except Exception as e:
+            logger.error(f"Error in admin_manage_exception: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
+
+    @app_commands.command(name="intro", description="Introduction and tutorial for new users")
+    async def intro(self, interaction: discord.Interaction):
+        """Show intro and tutorial."""
+        embed = discord.Embed(
+            title="👋 Hey folks, ShadowCrest here!",
+            description="Here's a quick tutorial to use this product.",
+            color=discord.Color.gold()
+        )
+        
+        embed.add_field(
+            name="🔑 Getting Started",
+            value=(
+                "Start by registering using the `/register` command and put your **PUBLIC** API key. "
+                "You will get a message when you do, and also when your key expires from the system due to any reason."
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🎯 How Alerts Work",
+            value=(
+                "When a mug target appears, this channel will be notified. "
+                "Click on **Attack Now** and proceed with the mug."
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚠️ NOTE: False Alerts",
+            value=(
+                "Sometimes (rare) due to issues with the server or with Torn API, there can be false alerts. "
+                "Some common false alerts are:\n\n"
+                "**1.** Last Action being recent (~2 minutes) and API not updated, "
+                "so it's possible they are not a target anymore.\n"
+                "**2.** Player turned off their bazaar and API/server didn't register it, "
+                "showing absurd amounts being considered as sales."
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="\u200b",
+            value="**Mug Wisely.** 🧠",
+            inline=False
+        )
+        
+        await interaction.response.send_message(embed=embed)
+        logger.info(f"Intro command used by {interaction.user}")
+
     @app_commands.command(name="help", description="Show help information")
     async def help_command(self, interaction: discord.Interaction):
-        """Show help information."""
+        """Show help information for users."""
         embed = discord.Embed(
             title="📖 Mug Bot Help",
-            description="Automated bazaar monitoring for mug targets",
+            description="Commands available to all users",
             color=discord.Color.blue()
         )
         
         embed.add_field(
-            name="/status",
-            value="Show current bot status and key statistics",
+            name="👋 /intro",
+            value="New here? Start with this — tutorial on how everything works and how to get set up.",
             inline=False
         )
         
         embed.add_field(
-            name="/recent [limit]",
-            value="Show recent mug alerts (default: 10, max: 50)",
+            name="🔑 /register api_key:<key>",
+            value="Register your PUBLIC Torn API key to contribute to the bot's key pool. You'll be DM'd if your key gets dropped.",
             inline=False
         )
         
         embed.add_field(
-            name="/stats",
-            value="Show detailed statistics and configuration",
+            name="🔓 /unregister",
+            value="Remove your API key from the bot.",
             inline=False
         )
         
         embed.add_field(
-            name="/help",
-            value="Show this help message",
+            name="📡 /status",
+            value="Quick overview — bot status, uptime, active targets, alerts in last 24h, and active API keys.",
             inline=False
         )
         
         embed.add_field(
-            name="ℹ️ How It Works",
-            value=(
-                "The bot monitors bazaar listings every 15 seconds. "
-                "When a player sells items worth $10M+, the bot checks if they're "
-                "inactive (2+ minutes). If so, an alert is sent with their profile and attack link."
-            ),
+            name="📋 /recent [limit]",
+            value="Shows recent mug alerts (default 10, max 50).",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📊 /stats",
+            value="Detailed stats — uptime, sales detected, monitored items, alert history, and thresholds.",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="❓ /help",
+            value="Shows this help message.",
             inline=False
         )
         
@@ -1025,6 +1206,90 @@ class BotCommands(commands.Cog):
         
         await interaction.response.send_message(embed=embed)
         logger.info(f"Help command used by {interaction.user}")
+
+    @app_commands.command(name="admin_help", description="[ADMIN] Show all admin commands")
+    @is_admin()
+    async def admin_help(self, interaction: discord.Interaction):
+        """Show all admin commands."""
+        await interaction.response.defer(ephemeral=True)
+        
+        embed = discord.Embed(
+            title="🔧 Admin Commands",
+            description="All commands restricted to admin only",
+            color=discord.Color.orange()
+        )
+        
+        embed.add_field(
+            name="🔑 API Key Management",
+            value=(
+                "**/admin_add_apikey** keys:<csv> — Add API keys (persisted to DB)\n"
+                "**/admin_delete_apikey** key_suffix:<last 4> — Remove a key by suffix\n"
+                "**/admin_set_rate_limit** calls_per_minute:<10-60> — Change rate limit per key"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📢 Channel Management",
+            value=(
+                "**/admin_set_channel** channel_id:<id> — Add an alert channel\n"
+                "**/admin_unset_channel** channel_id:<id> — Remove an alert channel"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⚙️ Monitoring Tuning",
+            value=(
+                "**/admin_minimum_accumulated** amount:<$> — Change min accumulated for alerts\n"
+                "**/admin_count_bazaar** count:<1-50> — Change top bazaar listings to monitor\n"
+                "**/admin_cycles_time** seconds:<1-300> — Change delay between cycles"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📦 Item Management",
+            value=(
+                "**/admin_add_item** item_id:<id> item_name:<name> — Add item to monitoring\n"
+                "**/admin_remove_item** item_id:<id> — Remove item from monitoring\n"
+                "**/admin_list_items** — Show all monitored items"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="⭐ VIP Management",
+            value=(
+                "**/admin_vip_add** player_id:<id> — Add VIP (never dropped)\n"
+                "**/admin_vip_remove** player_id:<id> — Remove VIP\n"
+                "**/admin_vip_list** — Show all VIP players"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🛡️ Exception Management",
+            value=(
+                "**/admin_manage_exception** — Add/Remove/List excepted players or factions\n"
+                "  • Excepted players/factions are instantly dropped and never mugged"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📊 Admin Info",
+            value=(
+                "**/admin_status** — Full stats including admin key count\n"
+                "**/admin_recent_drops** [limit] — Show recently dropped targets\n"
+                "**/admin_set_ffkey** status:<threshold> channel_id:<id> — Configure battle stats filtering\n"
+                "**/admin_help** — This help message"
+            ),
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.info(f"Admin help command used by {interaction.user}")
 
 
 async def setup(bot: commands.Bot):

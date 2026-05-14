@@ -39,24 +39,30 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Add this new function:
-async def start_keepalive_server():
+async def start_health_server():
     """
-    Start a simple HTTP server for keep-alive pings.
-    This prevents Discloud from shutting down due to inactivity.
+    Start a lightweight HTTP health-check endpoint for EC2 monitoring.
+    Hit GET / or GET /health to verify the bot is alive.
     """
     async def health_check(request):
         from core.monitor import get_monitor
+        import psutil, os
         try:
             monitor = get_monitor()
             stats = monitor.get_stats()
+            
+            # Memory info
+            process = psutil.Process(os.getpid())
+            mem = process.memory_info()
             
             return web.json_response({
                 'status': 'alive',
                 'uptime': stats.get('uptime', 'unknown'),
                 'cycles': stats.get('cycle_count', 0),
-                'is_running': stats.get('is_running', False)
+                'is_running': stats.get('is_running', False),
+                'memory_mb': round(mem.rss / (1024 * 1024), 1)
             })
-        except:
+        except Exception:
             return web.json_response({
                 'status': 'alive',
                 'message': 'Bot is running'
@@ -69,17 +75,12 @@ async def start_keepalive_server():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Use PORT from environment (Discloud provides this) or default to 8080
     port = int(os.getenv('PORT', 8080))
     
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     
-    logger.info(f"🌐 Keep-alive server started on port {port}")
-    
-    # Keep server running
-    while True:
-        await asyncio.sleep(3600)
+    logger.info(f"🌐 Health server started on port {port}")
 
 async def load_config() -> dict:
     """
@@ -162,16 +163,32 @@ async def initialize_database(config: dict):
     
         logger.info(f"Migrated {len(vip_players_from_config)} VIPs from config to database")
 
+    # Seed default exception factions (INSERT OR IGNORE — won't duplicate)
+    from database.models import ExceptionModel
+    exception_model = ExceptionModel()
+    default_factions = [
+        (16628, "Exception Faction #16628"),
+        (89, "Exception Faction #89"),
+        (8151, "Exception Faction #8151"),
+        (2013, "Exception Faction #2013"),
+        (27312, "Exception Faction #27312"),
+    ]
+    for fid, fname in default_factions:
+        await exception_model.add_faction(fid, fname, 0)  # 0 = system default
+
 
 async def initialize_api_keys():
-    """Initialize API key manager (empty, keys added via commands)."""
+    """Initialize API key manager and load persisted keys."""
     init_key_manager()
     
-    # Load registered keys from database
+    # Load admin keys from database (persisted across restarts)
     key_manager = get_key_manager()
+    await key_manager.load_admin_keys()
+    
+    # Load registered keys from database
     await key_manager.load_registered_keys()
     
-    logger.info("API key manager initialized (use /admin_add_apikey to add admin keys)")
+    logger.info("API key manager initialized")
     
 # Add to main.py before starting the bot
 async def test_weav3r():
@@ -219,8 +236,8 @@ async def main():
     # Test Weav3r (optional, you can keep this)
     await test_weav3r()
 
-    # Start keep-alive server in background
-    asyncio.create_task(start_keepalive_server())
+    # Start health server (no keep-alive loop needed on EC2)
+    await start_health_server()
 
     # Start bot
     logger.info("Starting Discord bot...")

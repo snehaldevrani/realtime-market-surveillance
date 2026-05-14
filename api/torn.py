@@ -196,16 +196,6 @@ class TornAPIClient:
                 # Parse profile
                 parsed_profile = parse_profile_response(profile_data, job_data)
 
-                # Format bazaar data
-                formatted_bazaar = []
-                for item in bazaar_data:
-                    formatted_bazaar.append({
-                        'item_id': item.get('ID'),
-                        'name': item.get('name'),
-                        'quantity': item.get('quantity'),
-                        'price': item.get('price')
-                    })
-
                 logger.debug(
                     f"✅ Fetched player {user_id}: {len(formatted_bazaar)} bazaar items, "
                     f"Status: {parsed_profile['status_state']}"
