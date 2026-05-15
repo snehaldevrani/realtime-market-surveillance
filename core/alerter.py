@@ -201,8 +201,12 @@ class Alerter:
             )
             
             # Add fields
-            embed.add_field(
-                name="� Max Potential Mug",
+            embed.add_field(                name="👤 Player",
+                value=f"**{embed_data['player_name']}** — [{embed_data['player_id']}](https://www.torn.com/profiles.php?XID={embed_data['player_id']})",
+                inline=False
+            )
+            
+            embed.add_field(                name="� Max Potential Mug",
                 value=f"**{embed_data['max_mug_short']}** ({embed_data['max_mug_full']})",
                 inline=True
             )
